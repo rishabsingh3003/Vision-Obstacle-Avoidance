@@ -8,6 +8,15 @@ The depth array as retrieved from the camera is divided into a 3x3 grid. The sma
 
 Currently the Avoidance system in ArduPilot is completely 2-D. This is being upgraded to 3D in the following PR: https://github.com/ArduPilot/ardupilot/pull/15553
 
+![D455](https://i.ibb.co/XCSj9zZ/d455.png)
+
+
+Demonstration of flight test with this Script and Intel RealSense D455: https://youtu.be/-6PWB52J3ho
+
+Demonstration of AirSim: 
+https://youtu.be/_G5LD6bPeJs
+
+
 ## Pre-Requirements for the entire project:
 
 1. Clone the branch of the above mentioned PR.
