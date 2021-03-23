@@ -27,7 +27,7 @@ sys.path.append("/usr/local/lib/")
 # Set MAVLink protocol to 2.
 import os
 os.environ["MAVLINK20"] = "1"
-
+os.chdir("/home/rishabh/Vision-Obstacle-Avoidance/Companion_Computer/")
 # Import the libraries
 import pyrealsense2 as rs
 import numpy as np
@@ -42,6 +42,7 @@ from time import sleep
 from apscheduler.schedulers.background import BackgroundScheduler
 from pymavlink import mavutil
 from numba import njit
+import detect_land
 
 # In order to import cv2 under python3 when you also have ROS Kinetic installed
 if os.path.exists("/opt/ros/kinetic/lib/python2.7/dist-packages"):
@@ -71,10 +72,7 @@ DEPTH_HEIGHT = 480               # Defines the number of lines for each frame or
 COLOR_WIDTH  = 640
 COLOR_HEIGHT = 480
 FPS          = 30
-DEPTH_RANGE_M = [0.1, 10]       # Replace with your sensor's specifics, in meter
-
-obstacle_line_height_ratio = 0.18  # [0-1]: 0-Top, 1-Bottom. The height of the horizontal line to find distance to obstacle.
-obstacle_line_thickness_pixel = 10 # [1-DEPTH_HEIGHT]: Number of pixel rows to use to generate the obstacle distance message. For each column, the scan will return the minimum value for those pixels centered vertically in the image.
+DEPTH_RANGE_M = [0.1, 0.3]       # Replace with your sensor's specifics, in meter
 
 USE_PRESET_FILE = True
 PRESET_FILE  = "presets/d4xx-high-accuracy.json"
@@ -127,7 +125,7 @@ device_id = None
 # Enable/disable each message/function individually
 enable_msg_obstacle_distance = True
 enable_msg_distance_sensor = False
-obstacle_distance_msg_hz_default = 5.0
+obstacle_distance_msg_hz_default = 15.0
 default_large_dist = 9999
 
 # lock for thread synchronization
@@ -138,7 +136,7 @@ lower_frame = [6,7,8]
 
 mavlink_thread_should_exit = False
 
-debug_enable_default = 0
+debug_enable_default = 1
 
 # default exit code is failure - a graceful termination with a
 # terminate signal is possible.
@@ -274,17 +272,23 @@ def send_obstacle_distance_3D_message():
         # no new frame
         return
     last_obstacle_distance_sent_ms = current_time_ms
+
+    sorted_array = []
+    for i in range(9):
+        dist = pow(mavlink_obstacle_coordinates[i][0],2) + pow(mavlink_obstacle_coordinates[i][1],2) + pow(mavlink_obstacle_coordinates[i][2],2)
+        sorted_array.append([dist,[mavlink_obstacle_coordinates[i][0], mavlink_obstacle_coordinates[i][1], mavlink_obstacle_coordinates[i][2]]])
+  
     for i in range(9):
         conn.mav.obstacle_distance_3d_send(
             current_time_ms,    # us Timestamp (UNIX time or time since system boot)
-            0,                  
-            0,                  
-            65535,              
-            float(mavlink_obstacle_coordinates[i][0]),	    
-            float(mavlink_obstacle_coordinates[i][1]),       
-            float(mavlink_obstacle_coordinates[i][2]),	    
-            float(DEPTH_RANGE_M[0]),       
-            float(DEPTH_RANGE_M[1])
+            0,
+            mavutil.mavlink.MAV_FRAME_BODY_FRD,
+            65535,
+            float(sorted_array[i][1][0]),
+            float(sorted_array[i][1][1]),
+            float(sorted_array[i][1][2]),
+            float(DEPTH_RANGE_M[0]),
+            float(DEPTH_RANGE_M[1] + 10)
         )
 
 def send_msg_to_gcs(text_to_be_sent):
@@ -393,7 +397,7 @@ def convert_depth_to_phys_coord_using_realsense(depth_coordinates, depth):
   center_pixel =  [depth_intrinsics.ppy/2,depth_intrinsics.ppx/2]
   result_center = rs.rs2_deproject_pixel_to_point(depth_intrinsics, center_pixel, depth)
   
-  return result[2], (result[1] - result_center[1]), -(result[0]- result_center[0])
+  return result[2], (result[1] - result_center[1]), (result[0]- result_center[0])
 
 @njit  
 def distances_from_depth_image(depth_mat, distances, min_depth_m, max_depth_m, depth, depth_coordinates):
@@ -434,6 +438,51 @@ def distances_from_depth_image(depth_mat, distances, min_depth_m, max_depth_m, d
     # print (depth[1])
     return depth_coordinates, depth
 
+def bottom_to_pc(depth_mat, min_depth_m, max_depth_m):
+    depth_img_width  = depth_mat.shape[1]
+    depth_img_height = depth_mat.shape[0]
+
+    # Parameters for obstacle distance message
+    step_x = depth_img_width/ 20
+    step_y = depth_img_height/ 10
+
+    x = 0
+    y = int(1/2* depth_img_height)
+
+    pc = []
+    coordinates = []
+    while x <= depth_img_width:
+        while y <= depth_img_height:
+            x_pixel = 0 if x < 0 else depth_img_width-1 if x > depth_img_width -1 else int(x)
+            y_pixel = 0 if y < 0 else depth_img_height-1 if y > depth_img_height -1 else int(y)
+            point_depth = depth_mat[y_pixel,x_pixel] * depth_scale
+            if point_depth < max_depth_m and point_depth > min_depth_m:
+                xyz = convert_depth_to_phys_coord_using_realsense([y_pixel,x_pixel], point_depth)
+                pc.append(xyz)
+                coordinates.append([y_pixel,x_pixel]) 
+            y = y + step_y
+
+        x = x + step_x
+        y = int(1/2* depth_img_height)
+
+    return pc,coordinates
+
+@njit
+def threshold_bottom_frame(minimum_depth, depth_mat):
+    depth_img_width  = depth_mat.shape[1]
+    depth_img_height = depth_mat.shape[0]
+    x = 0
+    y = int(2/3* depth_img_height)
+
+    while x < depth_img_width:
+        while y < depth_img_height: 
+            point_depth = depth_mat[y,x] * depth_scale
+            if (point_depth < minimum_depth):
+                depth_mat[y,x] = 0
+            y = y + 1
+
+        y = int(2/3*depth_img_height)
+        x = x + 1
 ######################################################
 ##  Functions - RTSP Streaming                      ##
 ##  Adapted from https://github.com/VimDrones/realsense-helper/blob/master/fisheye_stream_to_rtsp.py, credit to: @Huibean (GitHub)
@@ -608,12 +657,24 @@ try:
         # Extract depth in matrix form
         depth_data = filtered_frame.as_frame().get_data()
         depth_mat = np.asanyarray(depth_data)
+        # threshold_bottom_frame(0.8, depth_mat)
+
+        depth_mat_copy = np.copy(depth_mat)
+        #detect land if it is there
+        land_pc, pc_xy = bottom_to_pc(depth_mat_copy, DEPTH_RANGE_M[0], DEPTH_RANGE_M[1])
+        # try:
+        #     ground_list = detect_land.do_ransac(land_pc)
+        #     if ground_list:
+        #             for i in ground_list:
+        #                 cv2.circle(depth_mat_copy, (pc_xy[i][1],pc_xy[i][0]), 17, color = (0,0, 0), thickness = -1)
+        # except:
+        ground_list = None
 
         # Create obstacle distance data from depth image
         depth = np.ones((9,), dtype=np.float) * (DEPTH_RANGE_M[1] + 1)
         depth_coordinates = np.ones((9,2), dtype=np.uint16) * (default_large_dist)
-        obstacle_list, depth_list = distances_from_depth_image(depth_mat, distances, DEPTH_RANGE_M[0], DEPTH_RANGE_M[1], depth, depth_coordinates)
-        
+        obstacle_list, depth_list = distances_from_depth_image(depth_mat_copy, distances, DEPTH_RANGE_M[0], DEPTH_RANGE_M[1], depth, depth_coordinates)
+
         coordinate_list = np.ones((9,3), dtype = np.float) * (default_large_dist)
         for i in range(len(depth_list)):
             if (depth_list[i] < DEPTH_RANGE_M[1]): 
@@ -644,6 +705,10 @@ try:
                 cv2.line(output_image, (0, gy), (depth_mat.shape[1], gy), color=(0, 0, 0),thickness=1)
                 gy += pystep
             
+            if ground_list:
+               for i in ground_list:
+                   cv2.circle(output_image, (pc_xy[i][1],pc_xy[i][0]), 5, color = (0, 0, 0), thickness = 3)
+
             for i in range(len(depth_list)):
                 # output_image = cv2.putText(output_image, str(round(depth_list[i],2)), (int(pxstep*(1/4 + i%3)),int(pystep*(1/3 + m.floor(i/3)))), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0,0,255), 2)
                 if (depth_list[i] < DEPTH_RANGE_M[1]):

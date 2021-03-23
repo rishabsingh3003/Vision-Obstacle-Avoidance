@@ -19,7 +19,7 @@ from time import sleep
 from apscheduler.schedulers.background import BackgroundScheduler
 from pymavlink import mavutil
 import argparse
-
+import detect_land
 sys.path.append("/usr/local/lib/")
 
 # Set MAVLink protocol to 2.
@@ -62,7 +62,7 @@ client = airsim.MultirotorClient()
 client.confirmConnection()
 client.enableApiControl(True)
 
-DEPTH_RANGE_M = [0.3, 12] # depth range, to be changed as per requirements
+DEPTH_RANGE_M = [0.3, 100] # depth range, to be changed as per requirements
 MAX_DEPTH = 9999 # arbitrary large number 
 
 #numpy array to share obstacle coordinates between main thread and mavlink thread
@@ -94,7 +94,7 @@ def convert_depth_3D_vec(x_depth, y_depth, depth, fov):
     focal_len = w / (2 * np.tan(fov / 2))
     x = depth[y_depth, x_depth]
     y = (x_depth - center_x) * x / focal_len
-    z = -1 * (y_depth - center_y) * x / focal_len
+    z = (y_depth - center_y) * x / focal_len
     return x,y,z
 
 # divide the depth data into a 3x3 grid. Pick out the smallest distance in each grid
@@ -143,18 +143,45 @@ def distances_from_depth_image(depth_mat, min_depth_m, max_depth_m, depth, depth
                     valid_depth[i] = True
         
         sampling_width = sampling_width + int(1/3* depth_img_width)
-        
+
+
+def bottom_to_pc(depth_mat, min_depth_m, max_depth_m):
+    depth_img_width  = depth_mat.shape[1]
+    depth_img_height = depth_mat.shape[0]
+
+    # Parameters for obstacle distance message
+    step_x = depth_img_width/ 40
+    step_y = depth_img_height/ 30
+
+    x = 0
+    y = int(1/2* depth_img_height)
+
+    pc = []
+    coordinates = []
+    while x <= depth_img_width:
+        while y <= depth_img_height:
+            x_pixel = 0 if x < 0 else depth_img_width-1 if x > depth_img_width -1 else int(x)
+            y_pixel = 0 if y < 0 else depth_img_height-1 if y > depth_img_height -1 else int(y)
+            x_obj,y_obj,z_obj = convert_depth_3D_vec(x_pixel, y_pixel, depth_mat, math.radians(90))
+            point_depth = (x_obj*x_obj + y_obj*y_obj + z_obj*z_obj)**0.5
+            if point_depth < max_depth_m and point_depth > min_depth_m:
+                pc.append([x_obj, y_obj, z_obj])
+                coordinates.append([y_pixel,x_pixel]) 
+            y = y + step_y
+
+        x = x + step_x
+        y = int(1/2* depth_img_height)
+
+    
+    return pc,coordinates
+
+
 # display depth image from AirSim. The data received from AirSim needs to be proceeded for a good view 
 # also divides the view into 3x3 grid and prints smallest depth value in each grid
 # puts a circle on the smallest found depth value
-def getScreenDepthVis(client, depth_coordinates, depth_list):
-    #get image from airsim
-    responses = client.simGetImages([airsim.ImageRequest(0, airsim.ImageType.DepthPlanner, True, False)])
-    # condition the data
-    img1d = np.array(responses[0].image_data_float, dtype=np.float)
-    img1d = 255/np.maximum(np.ones(img1d.size), img1d)
-    img2d = np.reshape(img1d, (responses[0].height, responses[0].width))
-    image = np.invert(np.array(Image.fromarray(img2d.astype(np.uint8), mode='L')))
+def getScreenDepthVis(depth_mat, depth_coordinates, depth_list, ground_list, pc_xy):
+    depth_mat[depth_mat >= 255] = 255
+    image = np.invert(np.array(Image.fromarray(depth_mat.astype(np.uint8), mode='L')))
     
     factor = 10
     maxIntensity = 255.0 # depends on dtype of image data
@@ -179,12 +206,29 @@ def getScreenDepthVis(client, depth_coordinates, depth_list):
     # print circle, and depth values on the screen
     for i in range(len(depth_list)):
         if depth_list[i] <= DEPTH_RANGE_M[1]:
-            color_img = cv2.circle(color_img, (int(depth_coordinates[i][0]),int(depth_coordinates[i][1])), 5, (0, 0, 0), 5)
+            # color_img = cv2.circle(color_img, (int(depth_coordinates[i][0]),int(depth_coordinates[i][1])), 5, (0, 0, 0), 5)
             color_img = cv2.putText(color_img, str(round(depth_list[i],2)), (int(pxstep*(1/4 + i%3)),int(pystep*(1/3 + math.floor(i/3)))), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0,0,255), 2)
+    if ground_list:
+        for i in ground_list:
+            cv2.circle(color_img, (pc_xy[i][1],pc_xy[i][0]), 4, color = (0,0, 0), thickness = 5)
     
     cv2.imshow("Depth Vis", color_img)
     cv2.waitKey(1)
 
+def threshold_bottom_frame(minimum_depth, depth_mat):
+    depth_img_width  = depth_mat.shape[1]
+    depth_img_height = depth_mat.shape[0]
+    x = 0
+    y = int(2/3* depth_img_height)
+
+    while x < depth_img_width:
+        while y < depth_img_height: 
+            if depth_mat[y,x] < minimum_depth:
+                depth_mat[y,x] = 255
+            y = y + 1
+
+        y = int(2/3*depth_img_height)
+        x = x + 1
 
 def mavlink_loop(conn, callbacks):
     '''a main routine for a thread; reads data from a mavlink connection,
@@ -212,7 +256,7 @@ def send_obstacle_distance_3D_message():
         conn.mav.obstacle_distance_3d_send(
             time,    # us Timestamp (UNIX time or time since system boot)
             0,       # not implemented in ArduPilot            
-            0,       # not implemented in ArduPilot           
+            mavutil.mavlink.MAV_FRAME_BODY_FRD,              
             65535,   # unknown ID of the object. We are not really detecting the type of obstacle           
             float(mavlink_obstacle_coordinates[i][0]),	   # X in NEU body frame 
             float(mavlink_obstacle_coordinates[i][1]),     # Y in NEU body frame  
@@ -244,6 +288,15 @@ sched.start()
 while True:
     #depth image from airsim
     depth_mat,width,height = get_depth(client)
+
+    # land_pc, pc_xy = bottom_to_pc(depth_mat, DEPTH_RANGE_M[0], DEPTH_RANGE_M[1])
+    # ground_list = detect_land.do_ransac(land_pc)
+    # threshold_bottom_frame(0.8, depth_mat)
+    depth_mat_copy = np.copy(depth_mat)
+    # if ground_list:
+    #     for i in ground_list:
+    #         cv2.circle(depth_mat, (pc_xy[i][1],pc_xy[i][0]), 30, color = (0,0, 0), thickness = -1)
+    
     # Will be populated with smallest depth in each grid 
     depth_list = np.ones((9,), dtype=np.float) * (DEPTH_RANGE_M[1] + 1)
     # Valid depth in each grid will be marked True
@@ -263,5 +316,7 @@ while True:
             mavlink_obstacle_coordinates[i] = MAX_DEPTH
     
     # visualize the data
-    getScreenDepthVis(client, depth_coordinates, depth_list)
+    ground_list = None
+    pc_xy = None
+    getScreenDepthVis(depth_mat_copy, depth_coordinates, depth_list, ground_list, pc_xy)
     
