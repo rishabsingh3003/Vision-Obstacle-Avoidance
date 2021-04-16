@@ -42,6 +42,8 @@ from time import sleep
 from apscheduler.schedulers.background import BackgroundScheduler
 from pymavlink import mavutil
 from numba import njit
+import pickle
+
 
 # In order to import cv2 under python3 when you also have ROS Kinetic installed
 if os.path.exists("/opt/ros/kinetic/lib/python2.7/dist-packages"):
@@ -277,17 +279,18 @@ def send_obstacle_distance_3D_message():
     for i in range(9):
         conn.mav.obstacle_distance_3d_send(
             current_time_ms,    # us Timestamp (UNIX time or time since system boot)
-            0,                  
-            0,                  
-            65535,              
-            float(mavlink_obstacle_coordinates[i][0]),	    
-            float(mavlink_obstacle_coordinates[i][1]),       
-            float(mavlink_obstacle_coordinates[i][2]),	    
-            float(DEPTH_RANGE_M[0]),       
+            0,
+            mavutil.mavlink.MAV_FRAME_BODY_FRD,
+            65535,
+            float(mavlink_obstacle_coordinates[i][0]),
+            float(mavlink_obstacle_coordinates[i][1]),
+            float(mavlink_obstacle_coordinates[i][2]),
+            float(DEPTH_RANGE_M[0]),
             float(DEPTH_RANGE_M[1])
         )
 
 def send_msg_to_gcs(text_to_be_sent):
+    return
     # MAV_SEVERITY: 0=EMERGENCY 1=ALERT 2=CRITICAL 3=ERROR, 4=WARNING, 5=NOTICE, 6=INFO, 7=DEBUG, 8=ENUM_END
     text_msg = 'D4xx: ' + text_to_be_sent
     conn.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_INFO, text_msg.encode())
@@ -296,6 +299,7 @@ def send_msg_to_gcs(text_to_be_sent):
 # Request a timesync update from the flight controller, for future work.
 # TODO: Inspect the usage of timesync_update 
 def update_timesync(ts=0, tc=0):
+    return
     if ts == 0:
         ts = int(round(time.time() * 1000))
     conn.mav.timesync_send(tc, ts)
@@ -387,15 +391,19 @@ def realsense_configure_setting(setting_file):
     realsense_load_settings_file(advnc_mode, setting_file)
 
 
-def convert_depth_to_phys_coord_using_realsense(depth_coordinates, depth):
-  result = rs.rs2_deproject_pixel_to_point(depth_intrinsics, [depth_coordinates[0], depth_coordinates[1]], depth) 
-  
-  center_pixel =  [depth_intrinsics.ppy/2,depth_intrinsics.ppx/2]
-  result_center = rs.rs2_deproject_pixel_to_point(depth_intrinsics, center_pixel, depth)
-  
-  return result[2], (result[1] - result_center[1]), -(result[0]- result_center[0])
+def convert_depth_to_phys_coord_using_realsense(depth_mat, depth_coordinates, depth):
+    depth_img_width = depth_mat.shape[1]
+    depth_img_height = depth_mat.shape[0]
+    scale_x = depth_intrinsics.width/depth_img_width
+    scale_y = depth_intrinsics.height/depth_img_height
+    result = rs.rs2_deproject_pixel_to_point(depth_intrinsics, [depth_coordinates[0] * scale_x, depth_coordinates[1] * scale_y], depth)
 
-@njit  
+    center_pixel =  [depth_intrinsics.ppy, depth_intrinsics.ppx]
+    result_center = rs.rs2_deproject_pixel_to_point(depth_intrinsics, center_pixel, depth)
+
+    return result[2], (result[1] - result_center[1]), (result[0]- result_center[0])
+
+@njit
 def distances_from_depth_image(depth_mat, distances, min_depth_m, max_depth_m, depth, depth_coordinates):
     # Parameters for depth image
     depth_img_width  = depth_mat.shape[1]
@@ -405,7 +413,6 @@ def distances_from_depth_image(depth_mat, distances, min_depth_m, max_depth_m, d
     step_x = depth_img_width / 40
     step_y = depth_img_height/ 40
 
-    
     sampling_width = int(1/3 * depth_img_width)
     sampling_height = int(1/3* depth_img_height)
     for i in range(9):
@@ -427,7 +434,7 @@ def distances_from_depth_image(depth_mat, distances, min_depth_m, max_depth_m, d
                 if point_depth < depth[i] and point_depth > min_depth_m and point_depth < max_depth_m:
                     depth[i] = point_depth
                     # print(point_depth)
-                    depth_coordinates[i] = [y_pixel,x_pixel]
+                    depth_coordinates[i] = (y_pixel,x_pixel)
         
         sampling_width = sampling_width + int(1/3* depth_img_width)
         
@@ -494,6 +501,13 @@ def get_local_ip():
         local_ip_address = socket.gethostbyname(socket.gethostname())
     return local_ip_address
 
+def obstacle_array():
+    UDP_IP = "127.0.0.1"
+    UDP_PORT = 5005
+    message = pickle.dumps(mavlink_obstacle_coordinates)
+    sock = socket.socket(socket.AF_INET, # Internet
+                        socket.SOCK_DGRAM) # UDP
+    sock.sendto(message, (UDP_IP, UDP_PORT))
 
 ######################################################
 ##  Main code starts here                           ##
@@ -508,18 +522,18 @@ except Exception:
 
 progress("INFO: Starting Vehicle communications")
 print (connection_string)
-conn = mavutil.mavlink_connection(
-    device = str(connection_string),
-    autoreconnect = True,
-    source_system = 1,
-    source_component = 93,
-    baud=connection_baudrate,
-    force_connected=True,
-)
-mavlink_callbacks = {
-}
-mavlink_thread = threading.Thread(target=mavlink_loop, args=(conn, mavlink_callbacks))
-mavlink_thread.start()
+# conn = mavutil.mavlink_connection(
+#     device = str(connection_string),
+#     autoreconnect = True,
+#     source_system = 1,
+#     source_component = 93,
+#     baud=connection_baudrate,
+#     force_connected=True,
+# )
+# mavlink_callbacks = {
+# }
+# mavlink_thread = threading.Thread(target=mavlink_loop, args=(conn, mavlink_callbacks))
+# mavlink_thread.start()
 # connecting and configuring the camera is a little hit-and-miss.
 # Start a timer and rely on a restart of the script to get it working.
 # Configuring the camera appears to block all threads, so we can't do
@@ -537,18 +551,18 @@ send_msg_to_gcs('Camera connected.')
 signal.setitimer(signal.ITIMER_REAL, 0)  # cancel alarm
 
 
-# Send MAVlink messages in the background at pre-determined frequencies
-sched = BackgroundScheduler()
+# # Send MAVlink messages in the background at pre-determined frequencies
+# sched = BackgroundScheduler()
 
-if enable_msg_obstacle_distance:
-    sched.add_job(send_obstacle_distance_3D_message, 'interval', seconds = 1/obstacle_distance_msg_hz)
-    send_msg_to_gcs('Sending obstacle distance messages to FCU')
-else:
-    send_msg_to_gcs('Nothing to do. Check params to enable something')
-    pipe.stop()
-    conn.mav.close()
-    progress("INFO: Realsense pipe and vehicle object closed.")
-    sys.exit()
+# if enable_msg_obstacle_distance:
+#     sched.add_job(send_obstacle_distance_3D_message, 'interval', seconds = 1/obstacle_distance_msg_hz)
+#     send_msg_to_gcs('Sending obstacle distance messages to FCU')
+# else:
+#     send_msg_to_gcs('Nothing to do. Check params to enable something')
+#     pipe.stop()
+#     conn.mav.close()
+#     progress("INFO: Realsense pipe and vehicle object closed.")
+#     sys.exit()
 
 glib_loop = None
 if RTSP_STREAMING_ENABLE is True:
@@ -561,7 +575,7 @@ if RTSP_STREAMING_ENABLE is True:
 else:
     send_msg_to_gcs('RTSP not streaming')
 
-sched.start()
+# sched.start()
 
 # gracefully terminate the script if an interrupt signal (e.g. ctrl-c)
 # is received.  This is considered to be abnormal termination.
@@ -617,10 +631,11 @@ try:
         coordinate_list = np.ones((9,3), dtype = np.float) * (default_large_dist)
         for i in range(len(depth_list)):
             if (depth_list[i] < DEPTH_RANGE_M[1]): 
-                coordinates = convert_depth_to_phys_coord_using_realsense(obstacle_list[i],depth_list[i])
+                coordinates = convert_depth_to_phys_coord_using_realsense(depth_mat, obstacle_list[i],depth_list[i])
                 coordinate_list[i] = coordinates
     
         mavlink_obstacle_coordinates = coordinate_list
+        obstacle_array()
 
         if RTSP_STREAMING_ENABLE is True:
             color_image = np.asanyarray(color_frame.get_data())
@@ -689,6 +704,6 @@ finally:
         glib_thread.join()
     pipe.stop()
     mavlink_thread_should_exit = True
-    conn.close()
+    # conn.close()
     progress("INFO: Realsense pipe and vehicle object closed.")
     sys.exit(exit_code)
