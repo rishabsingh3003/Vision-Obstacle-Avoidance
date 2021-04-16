@@ -6,7 +6,8 @@
 #   pip3 install airsim
 #   pip3 install numpy
 #   sudo apt-get install python-PIL
-
+import os
+os.environ["MAVLINK20"] = "1"
 import math
 import sys
 import time
@@ -22,10 +23,7 @@ import argparse
 
 sys.path.append("/usr/local/lib/")
 
-# Set MAVLink protocol to 2.
-import os
 
-os.environ["MAVLINK20"] = "1"
 
 ######################################################
 ##  Parsing user' inputs                            ##
@@ -62,7 +60,7 @@ client = airsim.MultirotorClient()
 client.confirmConnection()
 client.enableApiControl(True)
 
-DEPTH_RANGE_M = [0.3, 12] # depth range, to be changed as per requirements
+DEPTH_RANGE_M = [0.3, 30] # depth range, to be changed as per requirements
 MAX_DEPTH = 9999 # arbitrary large number 
 
 #numpy array to share obstacle coordinates between main thread and mavlink thread
@@ -212,11 +210,11 @@ def send_obstacle_distance_3D_message():
         conn.mav.obstacle_distance_3d_send(
             time,    # us Timestamp (UNIX time or time since system boot)
             0,       # not implemented in ArduPilot            
-            0,       # not implemented in ArduPilot           
+            12,       # not implemented in ArduPilot           
             65535,   # unknown ID of the object. We are not really detecting the type of obstacle           
             float(mavlink_obstacle_coordinates[i][0]),	   # X in NEU body frame 
             float(mavlink_obstacle_coordinates[i][1]),     # Y in NEU body frame  
-            float(mavlink_obstacle_coordinates[i][2]),	   # Z in NEU body frame  
+            float(-mavlink_obstacle_coordinates[i][2]),	   # Z in NEU body frame  
             float(DEPTH_RANGE_M[0]), # min range of sensor
             float(DEPTH_RANGE_M[1])  # max range of sensor
         )
