@@ -3,11 +3,11 @@
 ######################################################
 ##  librealsense D4xx to MAVLink                    ##
 ######################################################
-# Requirements: 
+# Requirements:
 #   x86 based Companion Computer (for compatibility with Intel),
 #   Ubuntu 18.04 (otherwise, the following installation instruction might not work),
 #   Python3 (default with Ubuntu 18.04)
-# Install required packages: 
+# Install required packages:
 #   pip3 install pyrealsense2
 #   pip3 install numpy
 #   pip3 install pymavlink
@@ -42,6 +42,8 @@ from time import sleep
 from apscheduler.schedulers.background import BackgroundScheduler
 from pymavlink import mavutil
 from numba import njit
+import detect_land
+import traceback
 
 # In order to import cv2 under python3 when you also have ROS Kinetic installed
 if os.path.exists("/opt/ros/kinetic/lib/python2.7/dist-packages"):
@@ -71,10 +73,7 @@ DEPTH_HEIGHT = 480               # Defines the number of lines for each frame or
 COLOR_WIDTH  = 640
 COLOR_HEIGHT = 480
 FPS          = 30
-DEPTH_RANGE_M = [0.1, 10]       # Replace with your sensor's specifics, in meter
-
-obstacle_line_height_ratio = 0.18  # [0-1]: 0-Top, 1-Bottom. The height of the horizontal line to find distance to obstacle.
-obstacle_line_thickness_pixel = 10 # [1-DEPTH_HEIGHT]: Number of pixel rows to use to generate the obstacle distance message. For each column, the scan will return the minimum value for those pixels centered vertically in the image.
+DEPTH_RANGE_M = [0.1, 10.0]       # Replace with your sensor's specifics, in meter
 
 USE_PRESET_FILE = True
 PRESET_FILE  = "presets/d4xx-high-accuracy.json"
@@ -118,27 +117,22 @@ if filters[1][0] is True:
 connection_string_default = 'localhost:14551'
 connection_baudrate_default = 921600
 
-# Use this to rotate all processed data
-camera_facing_angle_degree = 0
-
 # Store device serial numbers of connected camera
 device_id = None
 
 # Enable/disable each message/function individually
 enable_msg_obstacle_distance = True
-enable_msg_distance_sensor = False
-obstacle_distance_msg_hz_default = 5.0
+obstacle_distance_msg_hz_default = 15.0
 default_large_dist = 9999
 
 # lock for thread synchronization
 lock = threading.Lock()
 
-# index for lower part of the depth frame in a 3x3 grid
-lower_frame = [6,7,8]
-
 mavlink_thread_should_exit = False
 
-debug_enable_default = 0
+debug_enable_default = 1
+
+ground_detection_default = 1
 
 # default exit code is failure - a graceful termination with a
 # terminate signal is possible.
@@ -147,9 +141,6 @@ exit_code = 1
 ######################################################
 ##  Global variables                                ##
 ######################################################
-
-# FCU connection variables
-vehicle_pitch_rad = None
 
 # Camera-related variables
 pipe = None
@@ -177,12 +168,18 @@ last_obstacle_distance_sent_ms = 0  # value of current_time_us when obstacle_dis
 # See here: https://mavlink.io/en/messages/common.html#OBSTACLE_DISTANCE
 min_depth_cm = int(DEPTH_RANGE_M[0] * 100)  # In cm
 max_depth_cm = int(DEPTH_RANGE_M[1] * 100)  # In cm, should be a little conservative
-distances_array_length = 72
-angle_offset = None
-increment_f  = None
-distances = np.ones((distances_array_length,), dtype=np.uint16) * (max_depth_cm + 1)
 
 mavlink_obstacle_coordinates = np.ones((9,3), dtype = np.float) * (9999)
+
+# part of the frame to use ground detection. This is a number between 0-1.
+ground_detection_frame_size = 0.5
+# obstacles closer that this many meters to the ground will be ignored
+ground_detection_thresh = 0.15
+
+# sampling step in x
+step_size_x = 8
+# sampling step in y
+step_size_y = 8
 ######################################################
 ##  Parsing user' inputs                            ##
 ######################################################
@@ -198,6 +195,8 @@ parser.add_argument('--debug_enable',type=float,
                     help="Enable debugging information")
 parser.add_argument('--camera_name', type=str,
                     help="Camera name to be connected to. If not specified, any valid camera will be connected to randomly. For eg: type 'D435I' to look for Intel RealSense D435I.")
+parser.add_argument('--ground_detection_enabled',type=float,
+                    help="Enable ground detection. This needs Numba to be installed.")
 args = parser.parse_args()
 
 connection_string = args.connect
@@ -205,6 +204,7 @@ connection_baudrate = args.baudrate
 obstacle_distance_msg_hz = args.obstacle_distance_msg_hz
 debug_enable = args.debug_enable
 camera_name = args.camera_name
+ground_detection_enable = args.ground_detection_enabled
 
 def progress(string):
     print(string, file=sys.stdout)
@@ -222,7 +222,7 @@ if not connection_baudrate:
     progress("INFO: Using default connection_baudrate %s" % connection_baudrate)
 else:
     progress("INFO: Using connection_baudrate %s" % connection_baudrate)
-    
+
 if not obstacle_distance_msg_hz:
     obstacle_distance_msg_hz = obstacle_distance_msg_hz_default
     progress("INFO: Using default obstacle_distance_msg_hz %s" % obstacle_distance_msg_hz)
@@ -238,6 +238,9 @@ for i in range(len(filters)):
 
 if not debug_enable:
     debug_enable = debug_enable_default
+
+if not ground_detection_enable:
+    ground_detection_enable =  ground_detection_default
 
 if debug_enable == 1:
     progress("INFO: Debugging option enabled")
@@ -269,21 +272,28 @@ def mavlink_loop(conn, callbacks):
 def send_obstacle_distance_3D_message():
     global current_time_ms, mavlink_obstacle_coordinates
     global last_obstacle_distance_sent_ms
-    
+
     if current_time_ms == last_obstacle_distance_sent_ms:
         # no new frame
         return
     last_obstacle_distance_sent_ms = current_time_ms
+
+    # ArduPilot has a easier time if you sort the array with distance. This is totally optional though. Might save a little bit CPU on the flight controller
+    sorted_array = []
+    for i in range(9):
+        dist = pow(mavlink_obstacle_coordinates[i][0],2) + pow(mavlink_obstacle_coordinates[i][1],2) + pow(mavlink_obstacle_coordinates[i][2],2)
+        sorted_array.append([dist,[mavlink_obstacle_coordinates[i][0], mavlink_obstacle_coordinates[i][1], mavlink_obstacle_coordinates[i][2]]])
+
     for i in range(9):
         conn.mav.obstacle_distance_3d_send(
             current_time_ms,    # us Timestamp (UNIX time or time since system boot)
-            0,                  
-            0,                  
-            65535,              
-            float(mavlink_obstacle_coordinates[i][0]),	    
-            float(mavlink_obstacle_coordinates[i][1]),       
-            float(mavlink_obstacle_coordinates[i][2]),	    
-            float(DEPTH_RANGE_M[0]),       
+            0,
+            mavutil.mavlink.MAV_FRAME_BODY_FRD,
+            65535,
+            float(sorted_array[i][1][0]),
+            float(sorted_array[i][1][1]),
+            float(sorted_array[i][1][2]),
+            float(DEPTH_RANGE_M[0]),
             float(DEPTH_RANGE_M[1])
         )
 
@@ -294,7 +304,7 @@ def send_msg_to_gcs(text_to_be_sent):
     progress("INFO: %s" % text_to_be_sent)
 
 # Request a timesync update from the flight controller, for future work.
-# TODO: Inspect the usage of timesync_update 
+# TODO: Inspect the usage of timesync_update
 def update_timesync(ts=0, tc=0):
     if ts == 0:
         ts = int(round(time.time() * 1000))
@@ -349,7 +359,7 @@ def realsense_load_settings_file(advnc_mode, setting_file):
     else:
         progress("INFO: Device does not support advanced mode")
         exit()
-    
+
     # Input for load_json() is the content of the json file, not the file path
     with open(setting_file, 'r') as file:
         json_text = file.read().strip()
@@ -364,7 +374,7 @@ def realsense_connect():
 
     # Configure image stream(s)
     config = rs.config()
-    if device_id: 
+    if device_id:
         # connect to a specific device ID
         config.enable_device(device_id)
     config.enable_stream(STREAM_TYPE[0], DEPTH_WIDTH, DEPTH_HEIGHT, FORMAT[0], FPS)
@@ -386,53 +396,99 @@ def realsense_configure_setting(setting_file):
     realsense_enable_advanced_mode(advnc_mode)
     realsense_load_settings_file(advnc_mode, setting_file)
 
-
+# convert depth to FRD body-frame vector
 def convert_depth_to_phys_coord_using_realsense(depth_coordinates, depth):
-  result = rs.rs2_deproject_pixel_to_point(depth_intrinsics, [depth_coordinates[0], depth_coordinates[1]], depth) 
-  
+  result = rs.rs2_deproject_pixel_to_point(depth_intrinsics, [depth_coordinates[0], depth_coordinates[1]], depth)
   center_pixel =  [depth_intrinsics.ppy/2,depth_intrinsics.ppx/2]
   result_center = rs.rs2_deproject_pixel_to_point(depth_intrinsics, center_pixel, depth)
-  
-  return result[2], (result[1] - result_center[1]), -(result[0]- result_center[0])
+  return result[2], (result[1] - result_center[1]), (result[0]- result_center[0])
 
-@njit  
-def distances_from_depth_image(depth_mat, distances, min_depth_m, max_depth_m, depth, depth_coordinates):
+# Samples points on the frame in pre-determined steps. Converts those points into a point cloud.
+def segment_frame(depth_mat):
     # Parameters for depth image
     depth_img_width  = depth_mat.shape[1]
     depth_img_height = depth_mat.shape[0]
 
-    # Parameters for obstacle distance message
-    step_x = depth_img_width / 40
-    step_y = depth_img_height/ 40
+    reduced_depth_mat = np.zeros(depth_mat.shape)
+    reduced_pc = np.zeros((depth_img_height, depth_img_width, 3), dtype= np.float)
 
-    
+    bottom_frame_considered_points = 0
+    bottom_frame_valid_points = 0
+    half_frame_height = int(0.5 * depth_img_height)
+
+    for y_pixel in range(0,depth_img_height, step_size_y):
+        for x_pixel in range(0, depth_img_width, step_size_x):
+            if (y_pixel > half_frame_height):
+                bottom_frame_considered_points = bottom_frame_considered_points + 1
+            point_depth = depth_mat[y_pixel,x_pixel] * depth_scale
+            if point_depth > DEPTH_RANGE_M[0] and point_depth < DEPTH_RANGE_M[1]:
+                if (y_pixel > half_frame_height):
+                    bottom_frame_valid_points = bottom_frame_valid_points + 1
+                reduced_depth_mat[y_pixel, x_pixel] = point_depth
+                body_x, body_y, body_z = convert_depth_to_phys_coord_using_realsense([y_pixel,x_pixel], point_depth)
+                reduced_pc[y_pixel, x_pixel] = [body_x, body_y, body_z]
+
+    bottom_frame_healthy = True
+    if (bottom_frame_considered_points == 0):
+        bottom_frame_healthy = False
+    else:
+        pct_valid_points = bottom_frame_valid_points/bottom_frame_considered_points
+        if pct_valid_points < 0.50:
+            bottom_frame_healthy = False
+
+    if not bottom_frame_healthy:
+        #less than half of the bottom frame is available. Ground detection will not be possible. Lets remove it.
+        reduced_depth_mat[half_frame_height:depth_img_height, 0:depth_img_width] = 0
+        depth_mat[half_frame_height:depth_img_height, 0:depth_img_width] = 0
+        reduced_pc[half_frame_height:depth_img_height, 0:depth_img_width] = [0, 0, 0]
+
+    return reduced_depth_mat, reduced_pc, bottom_frame_healthy
+
+# divides the frame into a 3x3 grid and picks out the closest obstacle in each grid
+@njit
+def grid_distances(depth_mat, reduced_depth_mat, reduced_pc, obstacle_distance_list, obstacle_vector_list, ground_eqn, valid_eqn):
+    # Parameters for depth image
+    depth_img_width  = depth_mat.shape[1]
+    depth_img_height = depth_mat.shape[0]
     sampling_width = int(1/3 * depth_img_width)
     sampling_height = int(1/3* depth_img_height)
+
     for i in range(9):
-        if i%3 == 0 and i != 0: 
+        if i%3 == 0 and i != 0:
             sampling_width = int(1/3* depth_img_width)
             sampling_height = sampling_height + int(1/3 * depth_img_height)
 
-        x,y = 0,0
-        x = sampling_width - int(1/3 * depth_img_width)
+        x_pixel = sampling_width - int(1/3 * depth_img_width)
         # print(i, sampling_width, sampling_height)
-        while x < sampling_width:
-            x = x + step_x
-            y = sampling_height - int(1/3* depth_img_height)
-            while y < sampling_height:
-                y = y + step_y
-                x_pixel = 0 if x < 0 else depth_img_width-1 if x > depth_img_width -1 else int(x)
-                y_pixel = 0 if y < 0 else depth_img_height-1 if y > depth_img_height -1 else int(y)
-                point_depth = depth_mat[y_pixel,x_pixel] * depth_scale
-                if point_depth < depth[i] and point_depth > min_depth_m and point_depth < max_depth_m:
-                    depth[i] = point_depth
-                    # print(point_depth)
-                    depth_coordinates[i] = [y_pixel,x_pixel]
-        
+        while x_pixel < sampling_width:
+            y_pixel = sampling_height - int(1/3* depth_img_height)
+            while y_pixel < sampling_height:
+                obs_vector = reduced_pc[y_pixel, x_pixel]
+                if (obs_vector[0]):
+                    dist_to_obs = np.linalg.norm(obs_vector)
+                    if (dist_to_obs < obstacle_distance_list[i]):
+                        if (valid_eqn):
+                            distance_to_plane = detect_land.distance_plane_to_point(ground_eqn, obs_vector)
+                            if (distance_to_plane > ground_detection_thresh):
+                                obstacle_distance_list[i] = dist_to_obs
+                                obstacle_vector_list[i] = obs_vector
+                        else:
+                            obstacle_distance_list[i] = dist_to_obs
+                            obstacle_vector_list[i] = obs_vector
+                y_pixel = y_pixel + 1
+            x_pixel = x_pixel + 1
         sampling_width = sampling_width + int(1/3* depth_img_width)
-        
-    # print (depth[1])
-    return depth_coordinates, depth
+
+# puts circle on the frame where ground was detected
+def filter_ground(depth_mat, reduced_depth_mat, pc, land_detect_area, ground_eqn):
+    width = pc.shape[0]
+    height = pc.shape[1]
+    for u in range(int(width*land_detect_area), width, step_size_x):
+            for v in range(0, height, step_size_y):
+                point = pc[u, v]
+                distance_to_plane = detect_land.distance_plane_to_point(ground_eqn, point)
+                if (distance_to_plane < ground_detection_thresh):
+                    cv2.circle(depth_mat, (v, u), 4, color = (0,0, 0), thickness = 4)
 
 ######################################################
 ##  Functions - RTSP Streaming                      ##
@@ -572,7 +628,7 @@ def sigint_handler(sig, frame):
 signal.signal(signal.SIGINT, sigint_handler)
 
 # gracefully terminate the script if a terminate signal is received
-# (e.g. kill -TERM).  
+# (e.g. kill -TERM).
 def sigterm_handler(sig, frame):
     global main_loop_should_quit
     main_loop_should_quit = True
@@ -609,18 +665,19 @@ try:
         depth_data = filtered_frame.as_frame().get_data()
         depth_mat = np.asanyarray(depth_data)
 
+        reduced_depth_mat, reduced_pc, bottom_frame_healthy = segment_frame(depth_mat)
+
+        if (ground_detection_enable and bottom_frame_healthy):
+            plane_eqn, valid_eqn = detect_land.run(reduced_pc, ground_detection_frame_size, step_size_x, step_size_y)
+        else:
+            plane_eqn, valid_eqn = np.array([0.0, 0.0, 0.0, 0.0]), False
         # Create obstacle distance data from depth image
-        depth = np.ones((9,), dtype=np.float) * (DEPTH_RANGE_M[1] + 1)
-        depth_coordinates = np.ones((9,2), dtype=np.uint16) * (default_large_dist)
-        obstacle_list, depth_list = distances_from_depth_image(depth_mat, distances, DEPTH_RANGE_M[0], DEPTH_RANGE_M[1], depth, depth_coordinates)
-        
-        coordinate_list = np.ones((9,3), dtype = np.float) * (default_large_dist)
-        for i in range(len(depth_list)):
-            if (depth_list[i] < DEPTH_RANGE_M[1]): 
-                coordinates = convert_depth_to_phys_coord_using_realsense(obstacle_list[i],depth_list[i])
-                coordinate_list[i] = coordinates
-    
-        mavlink_obstacle_coordinates = coordinate_list
+        depth_list = np.ones((9,), dtype=np.float) * (DEPTH_RANGE_M[1] + 1)
+        obstacle_list = np.ones((9,2), dtype=np.uint16) * (default_large_dist)
+        obstacle_vector_list = np.ones((9,3), dtype=np.float) * (default_large_dist)
+        grid_distances(depth_mat, reduced_depth_mat, reduced_pc, depth_list, obstacle_vector_list, plane_eqn, valid_eqn)
+
+        mavlink_obstacle_coordinates = obstacle_vector_list
 
         if RTSP_STREAMING_ENABLE is True:
             color_image = np.asanyarray(color_frame.get_data())
@@ -628,11 +685,14 @@ try:
 
         if debug_enable == 1:
             # Prepare the data
+            if valid_eqn:
+                filter_ground(depth_mat, reduced_depth_mat, reduced_pc, ground_detection_frame_size, plane_eqn)
+
             input_image = np.asanyarray(colorizer.colorize(depth_frame).get_data())
             output_image = np.asanyarray(colorizer.colorize(filtered_frame).get_data())
             color_image = np.asanyarray(color_frame.get_data())
-            
-             # divide view into 3x3 matrix
+
+                # divide view into 3x3 matrix
             pxstep = int(depth_mat.shape[1]/3)
             pystep = int(depth_mat.shape[0]/3)
             gx = pxstep
@@ -643,29 +703,30 @@ try:
             while gy < depth_mat.shape[0]:
                 cv2.line(output_image, (0, gy), (depth_mat.shape[1], gy), color=(0, 0, 0),thickness=1)
                 gy += pystep
-            
+
             for i in range(len(depth_list)):
                 # output_image = cv2.putText(output_image, str(round(depth_list[i],2)), (int(pxstep*(1/4 + i%3)),int(pystep*(1/3 + m.floor(i/3)))), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0,0,255), 2)
                 if (depth_list[i] < DEPTH_RANGE_M[1]):
-                    output_image = cv2.putText(output_image, str(round(coordinate_list[i][0],2)), (int(pxstep*(1/4 + i%3)),int(pystep*(1/3 + m.floor(i/3)))), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0,0,255), 2)                  
+                    output_image = cv2.putText(output_image, str(round(obstacle_vector_list[i][0],2)), (int(pxstep*(1/4 + i%3)),int(pystep*(1/3 + m.floor(i/3)))), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0,0,255), 2)
 
             display_image = np.hstack((input_image, cv2.resize(output_image, (DEPTH_WIDTH, DEPTH_HEIGHT))))
             cv2.namedWindow('Coloured Frames', cv2.WINDOW_AUTOSIZE)
             cv2.imshow('Coloured Frames', cv2.resize(color_image, (int(DEPTH_WIDTH), int(DEPTH_HEIGHT))))
 
+            # cv2.namedWindow('test', cv2.WINDOW_AUTOSIZE)
+            # cv2.imshow('test', cv2.resize(reduced_depth_mat, (int(DEPTH_WIDTH), int(DEPTH_HEIGHT))))
+
             # Put the fps in the corner of the image
             processing_speed = 1 / (time.time() - last_time)
             text = ("%0.2f" % (processing_speed,)) + ' fps'
             textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)[0]
-            cv2.putText(display_image, 
+            cv2.putText(display_image,
                         text,
                         org = (int((display_image.shape[1] - textsize[0]/2)), int((textsize[1])/2)),
                         fontFace = cv2.FONT_HERSHEY_SIMPLEX,
                         fontScale = 0.5,
                         thickness = 1,
                         color = (255, 255, 255))
-            
-
 
             # Show the images
             cv2.imshow(display_name, display_image)
@@ -676,9 +737,10 @@ try:
 except Exception as e:
     print (e)
     progress(e)
+    print(traceback.format_exc())
 
 except:
-    send_msg_to_gcs('ERROR: Depth camera disconnected')  
+    send_msg_to_gcs('ERROR: Depth camera disconnected')
 
 finally:
     progress('Closing the script...')
